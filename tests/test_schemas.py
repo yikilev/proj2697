@@ -14,14 +14,14 @@ DIAGNOSTICS = {"bm25_score", "semantic_score", "bm25_rank", "semantic_rank"}
 
 @pytest.mark.parametrize("field,value", [
     ("status", "ok"), ("index_loaded", True), ("documents_count", 1),
-    ("embedding_model", "model"), ("search_mode", "hybrid"),
+    ("embedding_model", 123), ("search_mode", "invalid"),
 ])
 def test_not_ready_health_rejects_contradictory_values(field, value):
     with pytest.raises(ValidationError):
         NotReadyHealthResponse.model_validate({field: value})
 
 
-@pytest.mark.parametrize("mode,model", [("bm25", None), ("hybrid", "intfloat/multilingual-e5-large")])
+@pytest.mark.parametrize("mode,model", [("bm25", None), ("hybrid", "bge-m3:latest")])
 def test_health_embedding_model_is_required_but_nullable(mode, model):
     payload = {
         "status": "ok", "index_loaded": True, "documents_count": 1,
@@ -49,7 +49,7 @@ def test_health_rejects_invalid_values(field, value):
 @pytest.mark.parametrize("query", [" Поиск ВКР \n", "42", "ёж", "中文", "C++", "а" * 4000])
 def test_request_normalizes_query_and_sets_defaults(query):
     request = SearchRequest(query=query)
-    assert request.model_dump() == {"query": query.strip(), "top_k": 10, "debug": False}
+    assert request.model_dump() == {"query": query.strip(), "top_k": 10, "debug": False, "search_mode": "bm25"}
 
 
 def test_query_length_is_checked_after_strip():

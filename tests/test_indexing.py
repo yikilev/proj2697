@@ -332,13 +332,13 @@ def test_cli_data_error_has_nonzero_exit(corpus, capsys):
     assert "Индексация не выполнена" in capsys.readouterr().err
 
 
-def test_cli_without_adapters_fails_clearly():
+def test_cli_help_describes_real_indexing_without_network():
     result = subprocess.run(
-        [sys.executable, "-m", "scripts.build_index", "--input", "data/sample_theses.json"],
-        cwd=ROOT, capture_output=True, text=True, check=False,
+        [sys.executable, "-m", "scripts.build_index", "--help"],
+        cwd=ROOT, capture_output=True, text=True, encoding="utf-8", check=False, timeout=30,
     )
-    assert result.returncode != 0
-    assert "Адаптеры энкодера и хранилища не подключены" in result.stderr
+    assert result.returncode == 0
+    assert "--batch-size" in result.stdout
     assert "Traceback" not in result.stderr
 
 

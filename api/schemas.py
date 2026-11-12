@@ -23,8 +23,8 @@ class NotReadyHealthResponse(BaseModel):
     status: Literal["not_ready"] = "not_ready"
     index_loaded: Literal[False] = False
     documents_count: Literal[0] = 0
-    search_mode: Literal["bm25"] = "bm25"
-    embedding_model: None = None
+    search_mode: Literal["bm25", "hybrid"] = "bm25"
+    embedding_model: str | None = None
 
 
 class ReplaceThesesRequest(BaseModel):
@@ -45,12 +45,13 @@ class ReplaceThesesResponse(BaseModel):
 
     status: Literal["ok"] = "ok"
     documents_count: int = Field(gt=0)
-    search_mode: Literal["bm25"] = "bm25"
+    search_mode: Literal["bm25", "hybrid"] = "bm25"
 
 
 class SearchRequest(BaseModel):
     model_config = ConfigDict(strict=True, extra="forbid")
 
+    search_mode: Literal["bm25", "hybrid"] = "bm25"
     query: Annotated[
         str, StringConstraints(strip_whitespace=True, min_length=1, max_length=4000)
     ]

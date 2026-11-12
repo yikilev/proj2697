@@ -58,7 +58,7 @@ def test_lifespan_initializes_once_and_health_never_encodes(snapshot, monkeypatc
             assert client.get("/theses/2").status_code == 200
         assert assembly.encoder.queries == []
         for _ in range(3):
-            assert client.post("/theses/search", json={"query": "Поиск"}).status_code == 200
+            assert client.post("/theses/search", json={"search_mode": "hybrid", "query": "Поиск"}).status_code == 200
         assert assembly.calls == assembly.storage.reads == bm25.call_count == semantic.call_count == 1
         assert assembly.encoder.queries == ["Поиск"] * 3
         assert assembly.encoder.batches == []
@@ -68,7 +68,7 @@ def test_lifespan_initializes_once_and_health_never_encodes(snapshot, monkeypatc
 @pytest.mark.parametrize("top_k,ids", [(1, ["10"]), (2, ["10", "2"]), (100, ["10", "2", "z"])])
 def test_search_http_ranking_and_debug(running, top_k, ids):
     client, assembly = running
-    payload = {"query": " \nПоиск\t ", "top_k": top_k, "debug": False}
+    payload = {"search_mode": "hybrid", "query": " \nПоиск\t ", "top_k": top_k, "debug": False}
     plain = client.post("/theses/search", json=payload)
     debug = client.post("/theses/search", json={**payload, "debug": True})
     assert plain.status_code == debug.status_code == 200
@@ -90,7 +90,7 @@ def test_search_http_ranking_and_debug(running, top_k, ids):
 
 def test_debug_keeps_null_for_missing_bm25_channel(running):
     client, _ = running
-    response = client.post("/theses/search", json={"query": "космонавтика", "debug": True})
+    response = client.post("/theses/search", json={"search_mode": "hybrid", "query": "космонавтика", "debug": True})
     assert response.status_code == 200
     for hit in response.json()["results"]:
         assert hit["bm25_score"] is None
@@ -105,7 +105,7 @@ def test_debug_keeps_null_for_missing_semantic_channel(snapshot):
     snapshot = replace(snapshot, cards=cards, vector_ids=tuple(card.id for card in cards),
                        vectors=np.tile([1.0, 0.0], (101, 1)))
     with TestClient(create_app(dependency_factory=FakeAssembly(snapshot))) as client:
-        response = client.post("/theses/search", json={"query": "Поиск", "top_k": 100, "debug": True})
+        response = client.post("/theses/search", json={"search_mode": "hybrid", "query": "Поиск", "top_k": 100, "debug": True})
         assert response.status_code == 200
         hit = next(hit for hit in response.json()["results"] if hit["id"] == "100")
         assert hit["bm25_rank"] == 1
@@ -114,11 +114,11 @@ def test_debug_keeps_null_for_missing_semantic_channel(snapshot):
 
 
 @pytest.mark.parametrize("payload", [
-    {}, {"query": ""}, {"query": " \n\t "}, {"query": "!?🙂"},
-    {"query": "я" * 4001}, {"query": None}, {"query": 123},
-    {"query": "Поиск", "extra": True},
-    *({"query": "Поиск", "top_k": value} for value in [0, 101, "10", 1.5, True, None]),
-    *({"query": "Поиск", "debug": value} for value in [0, "true", None]),
+    {}, {"search_mode": "hybrid", "query": ""}, {"search_mode": "hybrid", "query": " \n\t "}, {"search_mode": "hybrid", "query": "!?🙂"},
+    {"search_mode": "hybrid", "query": "я" * 4001}, {"search_mode": "hybrid", "query": None}, {"search_mode": "hybrid", "query": 123},
+    {"search_mode": "hybrid", "query": "Поиск", "extra": True},
+    *({"search_mode": "hybrid", "query": "Поиск", "top_k": value} for value in [0, 101, "10", 1.5, True, None]),
+    *({"search_mode": "hybrid", "query": "Поиск", "debug": value} for value in [0, "true", None]),
 ])
 def test_invalid_request_is_422_without_inference(running, payload):
     client, assembly = running
@@ -152,16 +152,33 @@ def test_card_and_unknown_id(running, snapshot):
     assert assembly.encoder.queries == []
 
 
+def test_mode_is_chosen_for_each_request_and_bm25_does_not_encode(running):
+    client, assembly = running
+    for mode in ("bm25", "hybrid", "bm25"):
+        response = client.post("/theses/search", json={
+            "query": "Поиск", "search_mode": mode, "debug": True,
+        })
+        assert response.status_code == 200
+        body = response.json()
+        assert body["count"] == (3 if mode == "hybrid" else 2)
+        if mode == "bm25":
+            assert all(hit["semantic_rank"] is None for hit in body["results"])
+    assert assembly.encoder.queries == ["Поиск"]
+    assembly.encoder.error = EncoderError("unavailable")
+    assert client.post("/theses/search", json={"query": "Поиск"}).status_code == 200
+    assert assembly.encoder.queries == ["Поиск"]
+
+
 def test_expected_encoder_error_is_503_and_health_does_not_probe_model(running):
     client, assembly = running
     assembly.encoder.error = EncoderError("unavailable")
-    response = client.post("/theses/search", json={"query": "Поиск"})
+    response = client.post("/theses/search", json={"search_mode": "hybrid", "query": "Поиск"})
     assert response.status_code == 503
     assert response.json() == {"detail": "Энкодер временно недоступен"}
     assert client.get("/health").status_code == 200
     assert assembly.encoder.queries == ["Поиск"]
     assembly.encoder.error = None
-    assert client.post("/theses/search", json={"query": "Поиск"}).status_code == 200
+    assert client.post("/theses/search", json={"search_mode": "hybrid", "query": "Поиск"}).status_code == 200
 
 
 @pytest.mark.parametrize("error", [RuntimeError("bug"), TypeError("bug"), ValueError("bug")])
@@ -169,7 +186,7 @@ def test_programming_errors_propagate(running, error):
     client, assembly = running
     assembly.encoder.error = error
     with pytest.raises(type(error)) as caught:
-        client.post("/theses/search", json={"query": "Поиск"})
+        client.post("/theses/search", json={"search_mode": "hybrid", "query": "Поиск"})
     assert caught.value is error
 
 
@@ -177,7 +194,7 @@ def test_invalid_encoder_vector_is_not_reported_as_expected_outage(running):
     client, assembly = running
     assembly.encoder.query_vector = np.array([0.0, 0.0])
     with pytest.raises(ValueError, match="L2-normalized"):
-        client.post("/theses/search", json={"query": "Поиск"})
+        client.post("/theses/search", json={"search_mode": "hybrid", "query": "Поиск"})
 
 
 @pytest.mark.parametrize("problem,match", [
@@ -205,13 +222,6 @@ def test_invalid_snapshot_aborts_startup(snapshot, problem, match):
     assert assembly.encoder.queries == assembly.encoder.batches == []
 
 
-def test_missing_integrations_abort_startup(monkeypatch):
-    monkeypatch.setenv("SEARCH_MODE", "hybrid")
-    with pytest.raises(RuntimeError, match="SEARCH_MODE=hybrid: адаптер эмбеддера не подключён"):
-        with TestClient(create_app()):
-            pytest.fail("Startup must fail")
-
-
 def test_factory_failure_aborts_startup():
     factory = Mock(side_effect=EncoderError("cannot load model"))
     with pytest.raises(EncoderError, match="cannot load model"):
@@ -224,7 +234,7 @@ def test_health_without_lifespan_cannot_report_ready():
     client = TestClient(create_app())
     responses = [
         client.get("/health"), client.get("/theses/2"),
-        client.post("/theses/search", json={"query": "Поиск"}),
+        client.post("/theses/search", json={"search_mode": "bm25", "query": "Поиск"}),
     ]
     for response in responses:
         assert response.status_code == 503
@@ -262,7 +272,7 @@ def test_synchronous_service_calls_run_outside_event_loop(running, monkeypatch):
     for name in ("search", "get_thesis", "health"):
         monkeypatch.setattr(service, name, record_thread(getattr(service, name)))
     event_loop_thread = client.portal.call(get_ident)
-    assert client.post("/theses/search", json={"query": "Поиск"}).status_code == 200
+    assert client.post("/theses/search", json={"search_mode": "hybrid", "query": "Поиск"}).status_code == 200
     assert client.get("/theses/2").status_code == 200
     assert client.get("/health").status_code == 200
     assert len(threads) == 3

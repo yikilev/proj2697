@@ -1,28 +1,45 @@
 """Поиск по одному снимку в памяти и объединение рейтингов через RRF."""
 
 from collections.abc import Sequence
+from _thread import LockType
 from threading import Lock
 from typing import Self
 
 from api.schemas import DebugSearchResult, SearchRequest, SearchResponse
 from domain.models import FusedHit, SearchHit, Thesis
-from external.embedder import Encoder, validate_vectors
+from external.embedder import Encoder, EncoderError, validate_vectors
 from infrastructure.search import BM25Index, SemanticIndex
-from infrastructure.storage import IndexStorage, SQLiteStorage
-from services.indexing import build_search_text, load_index
+from infrastructure.storage import IndexSnapshot, IndexStorage, SQLiteStorage
+from services.indexing import build_search_text, load_index, validate_index_snapshot
 
 
 CANDIDATE_LIMIT = 100
 
 
 class SearchService:
-    """Один экземпляр владеет энкодером для всех поисковых потоков приложения."""
+    """Поисковый снимок; экземпляры приложения используют общую блокировку энкодера."""
 
-    def __init__(self, *, storage: IndexStorage, encoder: Encoder) -> None:
+    def __init__(
+        self, *, storage: IndexStorage, encoder: Encoder, encode_lock: LockType | None = None,
+    ) -> None:
         snapshot = load_index(storage=storage, model=encoder.model)
+        self._initialize(snapshot, encoder, encode_lock)
+
+    @classmethod
+    def from_snapshot(
+        cls, snapshot: IndexSnapshot, *, encoder: Encoder, encode_lock: LockType,
+    ) -> Self:
+        """Построить поиск до сохранения и публикации нового снимка."""
+        service = cls.__new__(cls)
+        service._initialize(validate_index_snapshot(snapshot, model=encoder.model), encoder, encode_lock)
+        return service
+
+    def _initialize(
+        self, snapshot: IndexSnapshot, encoder: Encoder, encode_lock: LockType | None,
+    ) -> None:
         self._model = snapshot.metadata.model
         self._encoder = encoder
-        self._encode_lock = Lock()
+        self._encode_lock = encode_lock if encode_lock is not None else Lock()
         self._cards = {card.id: card for card in snapshot.cards}
         self._candidate_limit = min(CANDIDATE_LIMIT, len(self._cards))
         self._bm25 = BM25Index(
@@ -32,13 +49,15 @@ class SearchService:
         self._semantic = SemanticIndex(snapshot.vector_ids, snapshot.vectors)
 
     def search(self, request: SearchRequest) -> SearchResponse:
-        with self._encode_lock:
-            # Копия под блокировкой защищает от повторного использования буфера адаптером.
-            query_vector = validate_vectors(
-                self._encoder.encode_query(request.query), shape=(self._model.dimension,),
-            )
+        semantic_hits = []
+        if request.search_mode == "hybrid":
+            with self._encode_lock:
+                # Копия защищает от повторного использования буфера адаптером.
+                query_vector = validate_vectors(
+                    self._encoder.encode_query(request.query), shape=(self._model.dimension,),
+                )
+            semantic_hits = self._semantic.search(query_vector, limit=self._candidate_limit)
         bm25_hits = self._bm25.search(request.query, limit=self._candidate_limit)
-        semantic_hits = self._semantic.search(query_vector, limit=self._candidate_limit)
         hits = reciprocal_rank_fusion(bm25_hits, semantic_hits, top_k=request.top_k)
         results = [
             DebugSearchResult(
@@ -92,6 +111,8 @@ class BM25SearchService:
         )
 
     def search(self, request: SearchRequest) -> SearchResponse:
+        if request.search_mode == "hybrid":
+            raise EncoderError("Гибридный поиск недоступен: эмбеддер не подключён")
         bm25_hits = self._bm25.search(request.query, limit=self._candidate_limit)
         hits = reciprocal_rank_fusion(bm25_hits, [], top_k=request.top_k)
         results = [

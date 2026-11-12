@@ -1,8 +1,6 @@
 import logging
 import sqlite3
 from contextlib import closing
-import subprocess
-import sys
 from threading import get_ident
 from unittest.mock import Mock
 
@@ -10,44 +8,70 @@ import pytest
 from fastapi.testclient import TestClient
 
 import main
-from config.settings import PROJECT_ROOT, load_settings
+import config.settings as settings_module
+from config.settings import load_settings
 from infrastructure.storage import SQLiteStorage
 from tests.test_api import FakeAssembly
 from tests.test_bm25_service import cards as cards, storage as storage
 from tests.test_search_service import snapshot as snapshot
 
 
-@pytest.fixture(autouse=True)
-def isolated_settings(monkeypatch):
-    for name in ("SEARCH_MODE", "DATABASE_PATH", "LOG_LEVEL"):
-        monkeypatch.delenv(name, raising=False)
-    level = logging.getLogger().level
-    yield
-    logging.getLogger().setLevel(level)
-
-
 def test_defaults_ignore_cwd_and_dotenv(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
-    (tmp_path / ".env").write_text("SEARCH_MODE=hybrid\nDATABASE_PATH=other.sqlite3\n")
+    (tmp_path / ".env").write_text("SEARCH_MODE=hybrid\nDATABASE_PATH=other.sqlite3\n", encoding="utf-8")
     settings = load_settings()
-    assert settings.search_mode == "bm25"
-    assert settings.database_path == PROJECT_ROOT / "data/theses.sqlite3"
+    assert settings.database_path == settings_module.PROJECT_ROOT / "data/theses.sqlite3"
     assert settings.log_level == "INFO"
 
 
 def test_relative_database_path_is_project_relative(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("DATABASE_PATH", "data/../custom.sqlite3")
-    assert load_settings().database_path == PROJECT_ROOT / "custom.sqlite3"
+    assert load_settings().database_path == settings_module.PROJECT_ROOT / "custom.sqlite3"
+
+
+def test_project_dotenv_and_environment_priority(tmp_path, monkeypatch):
+    project = tmp_path / "настроенный проект"
+    project.mkdir()
+    (project / ".env").write_text(
+        'DATABASE_PATH="data/мои работы.sqlite3"\nLOG_LEVEL=warning\nSEARCH_MODE=hybrid\n'
+        'OLLAMA_ENABLED=true\nOLLAMA_BASE_URL=http://localhost:11435\nOLLAMA_TIMEOUT_SECONDS=12.5\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(settings_module, "PROJECT_ROOT", project)
+    monkeypatch.chdir(tmp_path)
+    assert load_settings().database_path == project / "data/мои работы.sqlite3"
+    assert load_settings().log_level == "WARNING"
+    assert load_settings().ollama_enabled is True
+    assert load_settings().ollama_base_url == "http://localhost:11435"
+    assert load_settings().ollama_timeout_seconds == 12.5
+    monkeypatch.setenv("DATABASE_PATH", "override.sqlite3")
+    monkeypatch.setenv("LOG_LEVEL", "ERROR")
+    monkeypatch.setenv("OLLAMA_ENABLED", "false")
+    monkeypatch.setenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
+    monkeypatch.setenv("OLLAMA_TIMEOUT_SECONDS", "30")
+    assert load_settings().database_path == project / "override.sqlite3"
+    assert load_settings().log_level == "ERROR"
+    assert load_settings().ollama_enabled is False
+    assert load_settings().ollama_base_url == "http://127.0.0.1:11434"
+    assert load_settings().ollama_timeout_seconds == 30
+
+
+def test_dotenv_does_not_interpolate_environment_variables(isolated_settings, monkeypatch):
+    monkeypatch.setenv("CORPUS_DIRECTORY", "another-directory")
+    (isolated_settings / ".env").write_text(
+        "DATABASE_PATH='${CORPUS_DIRECTORY}/index.sqlite3'\n", encoding="utf-8",
+    )
+    assert load_settings().database_path == isolated_settings / "${CORPUS_DIRECTORY}/index.sqlite3"
 
 
 @pytest.mark.parametrize("name,value", [
-    ("SEARCH_MODE", "typo"), ("SEARCH_MODE", ""),
     ("LOG_LEVEL", "verbose"), ("LOG_LEVEL", ""),
     ("DATABASE_PATH", ""), ("DATABASE_PATH", "  "),
     ("DATABASE_PATH", "."), ("DATABASE_PATH", "main.py/child.sqlite3"),
 ])
 def test_invalid_settings_abort_before_storage(name, value, monkeypatch):
+    (settings_module.PROJECT_ROOT / "main.py").write_text("", encoding="utf-8")
     monkeypatch.setenv(name, value)
     storage = Mock(side_effect=AssertionError("Storage must not be created"))
     monkeypatch.setattr(main, "SQLiteStorage", storage)
@@ -117,7 +141,7 @@ def test_missing_corpus_starts_without_creating_files(tmp_path, monkeypatch):
 
 def test_invalid_database_has_clear_error(tmp_path, monkeypatch):
     path = tmp_path / "broken.sqlite3"
-    path.write_text("not a SQLite database")
+    path.write_text("not a SQLite database", encoding="utf-8")
     monkeypatch.setenv("DATABASE_PATH", str(path))
     with pytest.raises(RuntimeError, match="DATABASE_PATH: не удалось прочитать корпус SQLite"):
         with TestClient(main.create_app()):
@@ -155,29 +179,17 @@ def test_storage_access_error_aborts_startup(storage, monkeypatch):
             pytest.fail("Startup must fail")
 
 
-def test_hybrid_cannot_fall_back_to_existing_bm25_corpus(storage, monkeypatch):
+@pytest.mark.parametrize("mode", ["hybrid", "invalid"])
+def test_search_mode_environment_does_not_select_request_mode(storage, monkeypatch, mode):
     monkeypatch.setenv("DATABASE_PATH", str(storage.path))
-    monkeypatch.setenv("SEARCH_MODE", "hybrid")
-    bm25 = Mock(side_effect=AssertionError("BM25 fallback is forbidden"))
-    monkeypatch.setattr(main, "BM25SearchService", bm25)
-    app = main.create_app()
-    with pytest.raises(RuntimeError, match="SEARCH_MODE=hybrid: адаптер эмбеддера не подключён"):
-        with TestClient(app):
-            pytest.fail("Startup must fail")
-    bm25.assert_not_called()
-    assert app.state.search_service is None
-    client = TestClient(app)
-    assert client.get("/health").status_code == 503
-    assert client.post("/theses/search", json={"query": "Поиск"}).status_code == 503
-    result = subprocess.run(
-        [sys.executable, "-m", "uvicorn", "main:app", "--app-dir", str(PROJECT_ROOT),
-         "--workers", "1"],
-        cwd=storage.path.parent, capture_output=True, text=True, timeout=30,
-    )
-    assert result.returncode != 0
-    assert "SEARCH_MODE=hybrid: адаптер эмбеддера не подключён" in result.stderr
-    assert "Application startup failed" in result.stderr
-    assert "Application startup complete" not in result.stderr
+    monkeypatch.setenv("SEARCH_MODE", mode)
+    with TestClient(main.create_app()) as client:
+        assert client.get("/health").status_code == 200
+        assert client.post("/theses/search", json={"query": "Поиск"}).status_code == 200
+        response = client.post("/theses/search", json={"query": "Поиск", "search_mode": "hybrid"})
+        assert response.status_code == 503
+        assert "эмбеддер не подключён" in response.json()["detail"]
+        assert client.post("/theses/search", json={"query": "Поиск", "search_mode": "bm25"}).status_code == 200
 
 
 @pytest.mark.parametrize("mode", ["bm25", "hybrid"])
@@ -192,7 +204,7 @@ def test_explicit_hybrid_factory_is_preserved(snapshot, monkeypatch, mode):
 
     with TestClient(main.create_app(dependency_factory=factory)) as client:
         assert client.get("/health").json()["search_mode"] == "hybrid"
-        assert client.post("/theses/search", json={"query": "Поиск"}).status_code == 200
+        assert client.post("/theses/search", json={"query": "Поиск", "search_mode": "hybrid"}).status_code == 200
         assert assembly.calls == assembly.storage.reads == 1
         assert assembly.encoder.queries == ["Поиск"]
         assert threads[0] != client.portal.call(get_ident)

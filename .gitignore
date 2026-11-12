@@ -33,6 +33,9 @@ coverage.xml
 *.sqlite3
 *.sqlite3-*
 
+# Reproducible HTTP payloads and CLI arrays from README examples
+/data/generated/
+
 # Downloaded models and caches
 /models/
 /weights/

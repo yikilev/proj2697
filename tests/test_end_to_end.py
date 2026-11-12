@@ -86,7 +86,7 @@ def test_sample_index_lifespan_http_search_card_and_health(indexed_sample):
     with TestClient(app) as client:
         assert storage.reads == 1
         for top_k in (1, 3, 10, 100):
-            payload = {"query": " \nRasdaman\t", "top_k": top_k}
+            payload = {"search_mode": "hybrid", "query": " \nRasdaman\t", "top_k": top_k}
             plain = client.post("/theses/search", json=payload)
             debug = client.post("/theses/search", json={**payload, "debug": True})
             assert plain.status_code == debug.status_code == 200
@@ -134,7 +134,7 @@ def test_reindex_is_visible_only_after_lifespan_restart(indexed_sample, tmp_path
         return AppDependencies(encoder, storage)
 
     app = create_app(dependency_factory=assemble)
-    query = {"query": "Rasdaman", "debug": True}
+    query = {"search_mode": "hybrid", "query": "Rasdaman", "debug": True}
     with TestClient(app) as client:
         original = client.post("/theses/search", json=query).json()
         old_card = client.get("/theses/hse-1162011207").json()
@@ -178,7 +178,7 @@ def test_failed_reimport_preserves_published_sample(indexed_sample, tmp_path, fa
     assert storage.writes == 1
     app = create_app(dependency_factory=lambda: AppDependencies(DeterministicEncoder(), storage))
     with TestClient(app) as client:
-        response = client.post("/theses/search", json={"query": "Rasdaman"})
+        response = client.post("/theses/search", json={"search_mode": "hybrid", "query": "Rasdaman"})
         assert response.status_code == 200
         assert response.json()["count"] == 6
         assert response.json()["results"][0]["id"] == "hse-1162011207"

@@ -51,6 +51,26 @@ def assert_corpus(client, database, expected):
     assert all(hit["semantic_rank"] is None and hit["semantic_score"] is None for hit in hits)
 
 
+def test_hybrid_without_encoder_fails_before_and_after_import(running):
+    client, database = running
+    for imported in (False, True):
+        if imported:
+            assert client.put("/theses", json={"cards": [card()]}).status_code == 200
+        response = client.post("/theses/search", json={"query": "Поиск", "search_mode": "hybrid"})
+        assert response.status_code == 503
+        assert response.json() == {"detail": "Гибридный поиск недоступен: эмбеддер не подключён"}
+        assert client.get("/docs").status_code == 200
+    assert_corpus(client, database, [card()])
+
+
+@pytest.mark.parametrize("mode", ["semantic", "auto", "BM25", "", None, True, 1])
+def test_invalid_mode_returns_422_even_without_corpus(running, mode):
+    client, _ = running
+    response = client.post("/theses/search", json={"query": "Поиск", "search_mode": mode})
+    assert response.status_code == 422
+    assert any(error["loc"] == ["body", "search_mode"] for error in response.json()["detail"])
+
+
 def test_first_import_replacement_repeat_and_restart(database):
     with TestClient(create_app()) as client:
         assert client.get("/docs").status_code == 200
@@ -110,7 +130,8 @@ def test_openapi_describes_both_health_states_and_json_import(running):
     assert health["503"]["content"]["application/json"]["schema"]["$ref"].endswith("/NotReadyHealthResponse")
     put = schema["paths"]["/theses"]["put"]
     assert set(put["requestBody"]["content"]) == {"application/json"}
-    assert {"200", "409", "422", "503"} <= put["responses"].keys()
+    assert {"200", "422", "503"} <= put["responses"].keys()
+    assert "409" not in put["responses"]
 
 
 def test_build_failure_keeps_database_and_search(running, monkeypatch):
@@ -281,16 +302,206 @@ def test_build_and_write_run_outside_event_loop(running, monkeypatch):
 
 
 @pytest.mark.parametrize("mode", ["bm25", "hybrid"])
-def test_actual_hybrid_rejects_import_without_changing_sqlite(database, snapshot, monkeypatch, mode):
+def test_actual_hybrid_import_replaces_sqlite_and_search(database, snapshot, monkeypatch, mode):
     database.replace_snapshot(snapshot)
-    before = database.path.read_bytes()
     encoder = FakeEncoder()
     monkeypatch.setenv("SEARCH_MODE", mode)
     app = create_app(dependency_factory=lambda: AppDependencies(encoder, database))
     with TestClient(app) as client:
-        original = client.post("/theses/search", json={"query": "Поиск"}).json()
         response = client.put("/theses", json={"cards": [card()]})
-        assert response.status_code == 409
-        assert database.path.read_bytes() == before
+        assert response.status_code == 200
+        assert response.json() == {"status": "ok", "documents_count": 1, "search_mode": "hybrid"}
+        assert encoder.batches == [["Поиск\nBM25\nОписание работы"]]
+        assert database.load_snapshot().vector_ids == ("first",)
         assert client.get("/health").json()["search_mode"] == "hybrid"
-        assert client.post("/theses/search", json={"query": "Поиск"}).json() == original
+        assert client.get("/theses/2").status_code == 404
+        result = client.post("/theses/search", json={"query": "Поиск", "search_mode": "hybrid", "debug": True})
+        assert result.status_code == 200
+        assert result.json()["results"][0]["id"] == "first"
+        assert result.json()["results"][0]["semantic_rank"] == 1
+
+
+@pytest.fixture
+def hybrid_running(database, snapshot):
+    database.replace_snapshot(snapshot)
+    encoder = FakeEncoder()
+    app = create_app(dependency_factory=lambda: AppDependencies(encoder, database))
+    with TestClient(app) as client:
+        yield client, database, encoder
+
+
+@pytest.mark.parametrize('failure', ['build', 'write', 'invalid_input', 'programming_error'])
+def test_hybrid_import_failure_preserves_search_and_vectors(hybrid_running, monkeypatch, failure):
+    client, database, encoder = hybrid_running
+    old_service = client.app.state.search_service
+    old_vectors = database.load_snapshot().vectors.copy()
+    payload = {'cards': [card('new')]}
+    if failure == 'write':
+        with closing(sqlite3.connect(database.path)) as connection, connection:
+            connection.execute("""
+                CREATE TRIGGER fail BEFORE INSERT ON index_state
+                BEGIN SELECT RAISE(ABORT, 'internal SQL /private/path'); END
+            """)
+    elif failure == 'build':
+        def fail_build(*args):
+            raise RuntimeError('index build failed')
+        monkeypatch.setattr('services.search.SemanticIndex', fail_build)
+    elif failure == 'programming_error':
+        def fail_encode(*args):
+            raise TypeError('bug')
+        monkeypatch.setattr(encoder, 'encode_documents', fail_encode)
+    else:
+        payload = {'cards': [card('duplicate'), card('duplicate')]}
+    before = database.path.read_bytes()
+    if failure in ('build', 'programming_error'):
+        with pytest.raises((RuntimeError, TypeError)):
+            client.put('/theses', json=payload)
+    else:
+        response = client.put('/theses', json=payload)
+        assert response.status_code == (503 if failure == 'write' else 422)
+        if failure == 'write':
+            assert response.json() == {'detail': 'Хранилище временно недоступно; корпус не заменён'}
+        else:
+            assert encoder.batches == []
+    assert client.app.state.search_service is old_service
+    assert database.path.read_bytes() == before
+    assert (database.load_snapshot().vectors == old_vectors).all()
+    response = client.post('/theses/search', json={'query': 'Поиск', 'search_mode': 'hybrid'})
+    assert response.status_code == 200
+    assert {hit['id'] for hit in response.json()['results']} == {'2', '10', 'z'}
+
+
+def test_hybrid_import_and_old_search_share_encoder_lock(database, snapshot, monkeypatch):
+    from threading import Lock
+    database.replace_snapshot(snapshot)
+    encoder = FakeEncoder()
+    encoding, query_waiting, saved = Event(), Event(), Event()
+    release_encode, release_publish = Event(), Event()
+    mutex = Lock()
+
+    class ObservedLock:
+        def __enter__(self):
+            if encoding.is_set():
+                query_waiting.set()
+            mutex.acquire()
+
+        def __exit__(self, *args):
+            mutex.release()
+
+    encode_documents, encode_query = encoder.encode_documents, encoder.encode_query
+
+    def controlled_documents(texts):
+        encoding.set()
+        assert release_encode.wait(5)
+        result = encode_documents(texts)
+        encoding.clear()
+        return result
+
+    def controlled_query(text):
+        assert not encoding.is_set()
+        return encode_query(text)
+
+    replace = database.replace_snapshot
+
+    def controlled_replace(snapshot):
+        replace(snapshot)
+        saved.set()
+        assert release_publish.wait(5)
+
+    monkeypatch.setattr(encoder, 'encode_documents', controlled_documents)
+    monkeypatch.setattr(encoder, 'encode_query', controlled_query)
+    monkeypatch.setattr(database, 'replace_snapshot', controlled_replace)
+    app = create_app(dependency_factory=lambda: AppDependencies(encoder, database))
+    app.state.encode_lock = ObservedLock()
+    with TestClient(app) as client, ThreadPoolExecutor(max_workers=2) as pool:
+        importing = pool.submit(client.put, '/theses', json={'cards': [card('new')]})
+        try:
+            assert encoding.wait(5)
+            # Лексический поиск и health доступны во время кодирования документов.
+            assert client.get('/health').status_code == 200
+            assert client.post('/theses/search', json={'query': 'Поиск'}).status_code == 200
+            searching = pool.submit(client.post, '/theses/search', json={'query': 'Поиск', 'search_mode': 'hybrid'})
+            assert query_waiting.wait(5)
+            assert encoder.queries == []
+            release_encode.set()
+            assert saved.wait(5)
+            response = searching.result(timeout=5)
+            assert response.status_code == 200
+            assert {hit['id'] for hit in response.json()['results']} == {'2', '10', 'z'}
+            assert client.get('/theses/new').status_code == 404
+        finally:
+            release_encode.set()
+            release_publish.set()
+        assert importing.result(timeout=5).status_code == 200
+        result = client.post('/theses/search', json={'query': 'Поиск', 'search_mode': 'hybrid'})
+        assert {hit['id'] for hit in result.json()['results']} == {'new'}
+
+
+def test_hybrid_concurrent_imports_publish_in_write_order(hybrid_running, monkeypatch):
+    client, database, encoder = hybrid_running
+    state = client.app.state
+    saved, second_waiting, release = Event(), Event(), Event()
+    lock = state.import_lock
+    replace = database.replace_snapshot
+
+    class ObservedLock:
+        def __enter__(self):
+            if saved.is_set():
+                second_waiting.set()
+            lock.acquire()
+
+        def __exit__(self, *args):
+            lock.release()
+
+    def controlled_replace(snapshot):
+        if snapshot.cards[0].id == 'second':
+            assert state.search_service.get_thesis('first') is not None
+        replace(snapshot)
+        if snapshot.cards[0].id == 'first':
+            saved.set()
+            assert release.wait(5)
+
+    monkeypatch.setattr(state, 'import_lock', ObservedLock())
+    monkeypatch.setattr(database, 'replace_snapshot', controlled_replace)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(client.put, '/theses', json={'cards': [card('first')]})
+        try:
+            assert saved.wait(5)
+            second = pool.submit(client.put, '/theses', json={'cards': [card('second')]})
+            assert second_waiting.wait(5)
+            assert len(encoder.batches) == 1
+        finally:
+            release.set()
+        assert first.result(timeout=5).status_code == second.result(timeout=5).status_code == 200
+    assert database.load_snapshot().vector_ids == ('second',)
+    assert client.get('/theses/second').status_code == 200
+    assert client.get('/theses/first').status_code == 404
+
+
+@pytest.mark.parametrize('fail_write', [False, True])
+def test_import_log_reports_saved_only_after_success(hybrid_running, monkeypatch, caplog, fail_write):
+    client, database, _ = hybrid_running
+    caplog.set_level('INFO', logger='api.routes')
+    original = database.replace_snapshot
+
+    def write(snapshot):
+        assert 'status=started' in caplog.text
+        assert 'status=saved' not in caplog.text
+        if fail_write:
+            raise sqlite3.OperationalError('PRIVATE_DATABASE_DETAILS')
+        original(snapshot)
+
+    monkeypatch.setattr(database, 'replace_snapshot', write)
+    response = client.put('/theses', json={'cards': [card('private-id', 'PRIVATE_TITLE')]})
+    messages = [record.getMessage() for record in caplog.records if record.name == 'api.routes']
+    assert len(messages) == 2
+    assert 'mode=hybrid documents=1 status=started' in messages[0]
+    assert 'duration_ms=' in messages[1]
+    if fail_write:
+        assert response.status_code == 503
+        assert 'status=error' in messages[1] and 'error=storage_error' in messages[1]
+        assert 'status=saved' not in caplog.text
+    else:
+        assert response.status_code == 200
+        assert 'status=saved' in messages[1]
+    assert 'PRIVATE_' not in caplog.text and 'private-id' not in caplog.text

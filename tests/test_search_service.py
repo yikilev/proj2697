@@ -78,7 +78,7 @@ def prepared(snapshot):
 @pytest.mark.parametrize("top_k,expected_ids", [(1, ["10"]), (2, ["10", "2"]), (10, ["10", "2", "z"]), (100, ["10", "2", "z"])])
 def test_search_fuses_channels_limits_and_resolves_ties(prepared, top_k, expected_ids):
     service, encoder, _ = prepared
-    response = service.search(SearchRequest(query=" \nПоиск\t ", top_k=top_k, debug=True))
+    response = service.search(SearchRequest(search_mode="hybrid", query=" \nПоиск\t ", top_k=top_k, debug=True))
     assert response.query == "Поиск"
     assert encoder.queries == ["Поиск"]
     assert response.count == len(response.results) == len(set(expected_ids))
@@ -96,7 +96,7 @@ def test_search_fuses_channels_limits_and_resolves_ties(prepared, top_k, expecte
 
 def test_no_word_overlap_still_uses_semantic_ranking(prepared):
     service, _, _ = prepared
-    response = service.search(SearchRequest(query="космонавтика", debug=True))
+    response = service.search(SearchRequest(search_mode="hybrid", query="космонавтика", debug=True))
     assert [hit.id for hit in response.results] == ["2", "10", "z"]
     assert [hit.semantic_score for hit in response.results] == [1, 0, -1]
     assert [hit.score for hit in response.results] == [1 / 61, 1 / 62, 1 / 63]
@@ -105,16 +105,16 @@ def test_no_word_overlap_still_uses_semantic_ranking(prepared):
 
 def test_debug_only_changes_diagnostics_and_repeated_search_is_stable(prepared):
     service, _, _ = prepared
-    plain = service.search(SearchRequest(query="Поиск")).model_dump(mode="json")
+    plain = service.search(SearchRequest(search_mode="hybrid", query="Поиск")).model_dump(mode="json")
     for _ in range(3):
-        debug = service.search(SearchRequest(query="Поиск", debug=True)).model_dump(mode="json")
+        debug = service.search(SearchRequest(search_mode="hybrid", query="Поиск", debug=True)).model_dump(mode="json")
         assert all(DIAGNOSTICS <= hit.keys() for hit in debug["results"])
         debug["results"] = [
             {key: value for key, value in hit.items() if key not in DIAGNOSTICS}
             for hit in debug["results"]
         ]
         assert debug == plain
-        assert service.search(SearchRequest(query="Поиск")).model_dump(mode="json") == plain
+        assert service.search(SearchRequest(search_mode="hybrid", query="Поиск")).model_dump(mode="json") == plain
 
 
 def test_card_lookup_and_health_do_not_encode_or_read_storage(prepared, snapshot):
@@ -135,7 +135,7 @@ def test_card_lookup_and_health_do_not_encode_or_read_storage(prepared, snapshot
 
 def test_snapshot_is_isolated_from_storage_and_returned_card_mutations(prepared, snapshot):
     service, _, storage = prepared
-    request = SearchRequest(query="Поиск", debug=True)
+    request = SearchRequest(search_mode="hybrid", query="Поиск", debug=True)
     original = service.search(request).model_dump()
     snapshot.cards[0].title = "Изменено"
     snapshot.cards[0].keywords.append("изменено")
@@ -158,10 +158,10 @@ def test_encoder_errors_propagate_without_fallback_and_lock_is_released(prepared
     service, encoder, storage = prepared
     encoder.error = error
     with pytest.raises(type(error)) as caught:
-        service.search(SearchRequest(query="Поиск"))
+        service.search(SearchRequest(search_mode="hybrid", query="Поиск"))
     assert caught.value is error
     encoder.error = None
-    assert service.search(SearchRequest(query="Поиск")).count == 3
+    assert service.search(SearchRequest(search_mode="hybrid", query="Поиск")).count == 3
     assert storage.reads == 1
 
 
@@ -170,7 +170,7 @@ def test_invalid_encoder_output_remains_an_error(prepared, vector):
     service, encoder, _ = prepared
     encoder.query_vector = np.array(vector)
     with pytest.raises(ValueError):
-        service.search(SearchRequest(query="Поиск"))
+        service.search(SearchRequest(search_mode="hybrid", query="Поиск"))
 
 
 @pytest.mark.parametrize("size", [1, 3, 105])
@@ -193,7 +193,7 @@ def test_indexes_are_built_once_and_channel_limits_are_capped(snapshot, monkeypa
     monkeypatch.setattr(service._bm25, "search", bm25_search)
     monkeypatch.setattr(service._semantic, "search", semantic_search)
     for top_k in [1, 10, 100]:
-        result = service.search(SearchRequest(query="Поиск", top_k=top_k))
+        result = service.search(SearchRequest(search_mode="hybrid", query="Поиск", top_k=top_k))
         assert [hit.id for hit in result.results] == [f"{i:03}" for i in range(min(size, top_k))]
         assert len({hit.id for hit in result.results}) == result.count
     assert bm25_factory.call_count == semantic_factory.call_count == storage.reads == 1
@@ -211,7 +211,7 @@ def test_candidate_cutoff_is_applied_before_fusion(snapshot):
     vectors[-1] = [1, 0]
     snapshot = replace(snapshot, cards=cards, vector_ids=tuple(card.id for card in cards), vectors=vectors)
     service = SearchService(storage=MemoryStorage(snapshot), encoder=FakeEncoder())
-    results = service.search(SearchRequest(query="Поиск", top_k=100, debug=True)).results
+    results = service.search(SearchRequest(search_mode="hybrid", query="Поиск", top_k=100, debug=True)).results
     assert [hit.id for hit in results] == (
         [f"{i:03}" for i in range(61)] + ["100"] + [f"{i:03}" for i in range(61, 99)]
     )
@@ -230,7 +230,7 @@ def test_build_load_and_search_never_reencode_corpus(tmp_path, snapshot):
     service = SearchService(storage=storage, encoder=encoder)
     assert encoder.queries == []
     for query in ["Поиск", "космонавтика", "ВКР"]:
-        assert service.search(SearchRequest(query=query)).count == 3
+        assert service.search(SearchRequest(search_mode="hybrid", query=query)).count == 3
     service.health()
     service.get_thesis("2")
     assert encoder.batches == batches
@@ -281,7 +281,7 @@ def test_concurrent_queries_serialize_model_encoding(snapshot):
 
     def search(_):
         barrier.wait(timeout=5)
-        return service.search(SearchRequest(query="Поиск")).model_dump()
+        return service.search(SearchRequest(search_mode="hybrid", query="Поиск")).model_dump()
 
     with ThreadPoolExecutor(max_workers=4) as pool:
         results = list(pool.map(search, range(4)))
@@ -303,4 +303,4 @@ def test_vectors_with_accepted_roundoff_work_from_import_through_search(tmp_path
     storage = MemoryStorage()
     build_index(path, encoder=encoder, storage=storage)
     service = SearchService(storage=storage, encoder=encoder)
-    assert service.search(SearchRequest(query="Поиск")).count == 3
+    assert service.search(SearchRequest(search_mode="hybrid", query="Поиск")).count == 3

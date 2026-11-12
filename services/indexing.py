@@ -52,9 +52,18 @@ def build_index(
     storage: IndexStorage,
     batch_size: int = 32,
 ) -> IndexingResult:
+    snapshot, result = prepare_index(read_corpus(input_path), encoder=encoder, batch_size=batch_size)
+    storage.replace_snapshot(snapshot)
+    return result
+
+
+def prepare_index(
+    cards: tuple[Thesis, ...], *, encoder: Encoder, batch_size: int = 32,
+) -> tuple[IndexSnapshot, IndexingResult]:
+    """Подготовить полный снимок без записи: общий путь для HTTP и CLI."""
     if type(batch_size) is not int or batch_size <= 0:
         raise ValueError("batch_size must be a positive integer")
-    cards = read_corpus(input_path)
+    _validate_card_ids(cards)
     metadata = _metadata(encoder.model)
     vectors = np.empty((len(cards), metadata.model.dimension), dtype=np.float32)
     truncated_count = 0
@@ -70,16 +79,19 @@ def build_index(
 
     vectors.flags.writeable = False
     snapshot = IndexSnapshot(cards, tuple(card.id for card in cards), vectors, metadata)
-    storage.replace_snapshot(snapshot)
-    return IndexingResult(len(cards), truncated_count)
+    return snapshot, IndexingResult(len(cards), truncated_count)
 
 
 def load_index(*, storage: IndexStorage, model: ModelDescription) -> IndexSnapshot:
     """Проверить границу хранения перед использованием снимка в поиске."""
-    expected = _metadata(model)
     snapshot = storage.load_snapshot()
     if snapshot is None:
         raise ValueError("Index is missing; build it before loading")
+    return validate_index_snapshot(snapshot, model=model)
+
+
+def validate_index_snapshot(snapshot: IndexSnapshot, *, model: ModelDescription) -> IndexSnapshot:
+    expected = _metadata(model)
     if snapshot.metadata != expected:
         raise ValueError("Index metadata is incompatible with the model or text preparation version")
 

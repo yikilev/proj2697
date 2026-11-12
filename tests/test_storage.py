@@ -1,4 +1,5 @@
 import json
+import os
 import sqlite3
 import struct
 from concurrent.futures import ThreadPoolExecutor
@@ -34,7 +35,14 @@ def snapshot():
 
 @pytest.fixture
 def storage(tmp_path):
-    return SQLiteStorage(tmp_path / "nested" / "index ?#.sqlite")
+    return SQLiteStorage(tmp_path / "данные с пробелами" / "index %#.sqlite")
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows запрещает ? в имени файла")
+def test_uri_escapes_question_mark_on_posix(tmp_path, snapshot):
+    storage = SQLiteStorage(tmp_path / "index ?#.sqlite")
+    storage.replace_snapshot(snapshot)
+    assert_snapshot(storage.load_snapshot(), snapshot)
 
 
 def execute(storage, sql, parameters=()):
@@ -287,7 +295,7 @@ def test_indexing_service_with_real_sqlite(tmp_path, storage, snapshot):
         health = client.get("/health")
         assert health.status_code == 200
         assert health.json()["documents_count"] == 2
-        response = client.post("/theses/search", json={"query": "Поиск"})
+        response = client.post("/theses/search", json={"query": "Поиск", "search_mode": "hybrid"})
         assert response.status_code == 200
         assert response.json()["count"] == 2
         assert response.json()["results"][0]["id"] == "z"

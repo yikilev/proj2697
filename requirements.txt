@@ -9,6 +9,7 @@ numpy==2.4.6
 opentelemetry-api==1.45.2
 pydantic==2.14.3
 pydantic_core==2.50.4
+python-dotenv==1.2.4
 rank-bm25==0.2.2
 starlette==1.10.0
 typing-inspection==0.4.5

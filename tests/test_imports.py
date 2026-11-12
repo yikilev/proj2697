@@ -59,7 +59,7 @@ assert not violations, violations
 '''
     result = subprocess.run(
         [sys.executable, "-B", "-c", script, str(ROOT), *modules],
-        cwd=tmp_path, capture_output=True, text=True, check=False, timeout=30,
+        cwd=tmp_path, capture_output=True, text=True, encoding="utf-8", check=False, timeout=30,
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout == ""
