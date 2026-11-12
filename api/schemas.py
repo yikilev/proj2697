@@ -13,7 +13,39 @@ class HealthResponse(BaseModel):
     status: Literal["ok"]
     index_loaded: Literal[True]
     documents_count: int = Field(gt=0)
-    embedding_model: str
+    search_mode: Literal["bm25", "hybrid"]
+    embedding_model: str | None
+
+
+class NotReadyHealthResponse(BaseModel):
+    model_config = ConfigDict(strict=True, extra="forbid")
+
+    status: Literal["not_ready"] = "not_ready"
+    index_loaded: Literal[False] = False
+    documents_count: Literal[0] = 0
+    search_mode: Literal["bm25"] = "bm25"
+    embedding_model: None = None
+
+
+class ReplaceThesesRequest(BaseModel):
+    model_config = ConfigDict(strict=True, extra="forbid")
+
+    cards: list[Thesis] = Field(min_length=1)
+
+    @field_validator("cards")
+    @classmethod
+    def unique_ids(cls, cards: list[Thesis]) -> list[Thesis]:
+        if len({card.id for card in cards}) != len(cards):
+            raise ValueError("Card IDs must be unique after normalization")
+        return cards
+
+
+class ReplaceThesesResponse(BaseModel):
+    model_config = ConfigDict(strict=True, extra="forbid")
+
+    status: Literal["ok"] = "ok"
+    documents_count: int = Field(gt=0)
+    search_mode: Literal["bm25"] = "bm25"
 
 
 class SearchRequest(BaseModel):

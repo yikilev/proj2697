@@ -117,6 +117,7 @@ def test_sample_index_lifespan_http_search_card_and_health(indexed_sample):
         assert health.json() == {
             "status": "ok", "index_loaded": True, "documents_count": 6,
             "embedding_model": encoder.model.identifier,
+            "search_mode": "hybrid",
         }
         assert encoder.queries == ["Rasdaman"] * 8
         assert encoder.batches == []

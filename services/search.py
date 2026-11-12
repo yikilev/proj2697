@@ -2,12 +2,13 @@
 
 from collections.abc import Sequence
 from threading import Lock
+from typing import Self
 
 from api.schemas import DebugSearchResult, SearchRequest, SearchResponse
 from domain.models import FusedHit, SearchHit, Thesis
 from external.embedder import Encoder, validate_vectors
 from infrastructure.search import BM25Index, SemanticIndex
-from infrastructure.storage import IndexStorage
+from infrastructure.storage import IndexStorage, SQLiteStorage
 from services.indexing import build_search_text, load_index
 
 
@@ -61,7 +62,62 @@ class SearchService:
             "status": "ok",
             "index_loaded": True,
             "documents_count": len(self._cards),
+            "search_mode": "hybrid",
             "embedding_model": self._model.identifier,
+        }
+
+
+class BM25SearchService:
+    """Лексический поиск по карточкам SQLite, загруженным один раз при создании."""
+
+    def __init__(self, *, storage: SQLiteStorage) -> None:
+        cards = storage.load_cards(validate_snapshot=False)
+        if not cards:
+            raise ValueError("BM25 corpus is missing or empty")
+        self._initialize(cards)
+
+    @classmethod
+    def from_cards(cls, cards: tuple[Thesis, ...]) -> Self:
+        """Построить независимый снимок из валидированного непустого корпуса."""
+        service = cls.__new__(cls)
+        service._initialize(cards)
+        return service
+
+    def _initialize(self, cards: tuple[Thesis, ...]) -> None:
+        self._cards = {card.id: card.model_copy(deep=True) for card in cards}
+        self._candidate_limit = min(CANDIDATE_LIMIT, len(cards))
+        self._bm25 = BM25Index(
+            [card.id for card in cards],
+            [build_search_text(card) for card in cards],
+        )
+
+    def search(self, request: SearchRequest) -> SearchResponse:
+        bm25_hits = self._bm25.search(request.query, limit=self._candidate_limit)
+        hits = reciprocal_rank_fusion(bm25_hits, [], top_k=request.top_k)
+        results = [
+            DebugSearchResult(
+                **self._cards[hit.id].model_dump(),
+                score=hit.score,
+                bm25_score=hit.bm25_score,
+                semantic_score=hit.semantic_score,
+                bm25_rank=hit.bm25_rank,
+                semantic_rank=hit.semantic_rank,
+            )
+            for hit in hits
+        ]
+        return SearchResponse.from_results(request, results)
+
+    def get_thesis(self, thesis_id: str) -> Thesis | None:
+        card = self._cards.get(thesis_id)
+        return card.model_copy(deep=True) if card is not None else None
+
+    def health(self) -> dict[str, str | bool | int | None]:
+        return {
+            "status": "ok",
+            "index_loaded": True,
+            "documents_count": len(self._cards),
+            "search_mode": "bm25",
+            "embedding_model": None,
         }
 
 

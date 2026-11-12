@@ -3,10 +3,47 @@ import json
 import pytest
 from pydantic import ValidationError
 
-from api.schemas import DebugSearchResult, SearchRequest, SearchResponse, SearchResult
+from api.schemas import (
+    DebugSearchResult, HealthResponse, NotReadyHealthResponse,
+    SearchRequest, SearchResponse, SearchResult,
+)
 
 
 DIAGNOSTICS = {"bm25_score", "semantic_score", "bm25_rank", "semantic_rank"}
+
+
+@pytest.mark.parametrize("field,value", [
+    ("status", "ok"), ("index_loaded", True), ("documents_count", 1),
+    ("embedding_model", "model"), ("search_mode", "hybrid"),
+])
+def test_not_ready_health_rejects_contradictory_values(field, value):
+    with pytest.raises(ValidationError):
+        NotReadyHealthResponse.model_validate({field: value})
+
+
+@pytest.mark.parametrize("mode,model", [("bm25", None), ("hybrid", "intfloat/multilingual-e5-large")])
+def test_health_embedding_model_is_required_but_nullable(mode, model):
+    payload = {
+        "status": "ok", "index_loaded": True, "documents_count": 1,
+        "search_mode": mode, "embedding_model": model,
+    }
+    assert HealthResponse.model_validate(payload).model_dump() == payload
+    del payload["embedding_model"]
+    with pytest.raises(ValidationError):
+        HealthResponse.model_validate(payload)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("status", "error"), ("index_loaded", False), ("documents_count", 0),
+    ("search_mode", "auto"), ("embedding_model", 123),
+])
+def test_health_rejects_invalid_values(field, value):
+    payload = {
+        "status": "ok", "index_loaded": True, "documents_count": 1,
+        "search_mode": "bm25", "embedding_model": None,
+    }
+    with pytest.raises(ValidationError):
+        HealthResponse.model_validate({**payload, field: value})
 
 
 @pytest.mark.parametrize("query", [" Поиск ВКР \n", "42", "ёж", "中文", "C++", "а" * 4000])

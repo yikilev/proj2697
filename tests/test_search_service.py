@@ -127,6 +127,7 @@ def test_card_lookup_and_health_do_not_encode_or_read_storage(prepared, snapshot
         assert service.health() == {
             "status": "ok", "index_loaded": True, "documents_count": 3,
             "embedding_model": "fake",
+            "search_mode": "hybrid",
         }
     assert encoder.queries == encoder.batches == []
     assert storage.reads == 1

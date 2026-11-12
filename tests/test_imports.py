@@ -8,7 +8,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_application_imports_without_io_or_test_dependencies(tmp_path):
+def test_application_imports_without_io_or_test_dependencies(tmp_path, monkeypatch):
+    monkeypatch.setenv("SEARCH_MODE", "invalid-until-startup")
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "absent" / "theses.sqlite3"))
     modules = ["main"]
     for package in ("api", "config", "domain", "external", "infrastructure", "scripts", "services"):
         modules.extend(

@@ -53,6 +53,7 @@ def test_lifespan_initializes_once_and_health_never_encodes(snapshot, monkeypatc
             assert response.json() == {
                 "status": "ok", "index_loaded": True,
                 "documents_count": 3, "embedding_model": MODEL.identifier,
+                "search_mode": "hybrid",
             }
             assert client.get("/theses/2").status_code == 200
         assert assembly.encoder.queries == []
@@ -204,8 +205,9 @@ def test_invalid_snapshot_aborts_startup(snapshot, problem, match):
     assert assembly.encoder.queries == assembly.encoder.batches == []
 
 
-def test_missing_integrations_abort_startup():
-    with pytest.raises(RuntimeError, match="Адаптеры энкодера и хранилища не подключены"):
+def test_missing_integrations_abort_startup(monkeypatch):
+    monkeypatch.setenv("SEARCH_MODE", "hybrid")
+    with pytest.raises(RuntimeError, match="SEARCH_MODE=hybrid: адаптер эмбеддера не подключён"):
         with TestClient(create_app()):
             pytest.fail("Startup must fail")
 
@@ -226,13 +228,19 @@ def test_health_without_lifespan_cannot_report_ready():
     ]
     for response in responses:
         assert response.status_code == 503
-        assert response.json() == {"detail": "Поисковый сервис не инициализирован"}
+    assert responses[0].json()["status"] == "not_ready"
+    assert responses[0].json()["index_loaded"] is False
+    for response in responses[1:]:
+        assert "PUT /theses" in response.json()["detail"]
 
 
 def test_import_main_does_not_prepare_service_or_open_database(monkeypatch):
     service = Mock(side_effect=AssertionError("Service created during import"))
     connect = Mock(side_effect=AssertionError("Database opened during import"))
-    monkeypatch.setattr("services.search.SearchService", service)
+    monkeypatch.setattr("services.search.SearchService.__init__", service)
+    monkeypatch.setattr("services.search.BM25SearchService.__init__", service)
+    monkeypatch.setattr("infrastructure.storage.SQLiteStorage.__init__", service)
+    monkeypatch.setattr("config.settings.load_settings", service)
     monkeypatch.setattr("sqlite3.connect", connect)
     module = runpy.run_module("main")
     assert module["app"].state.search_service is None
