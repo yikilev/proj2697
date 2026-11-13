@@ -4,6 +4,7 @@ from collections.abc import Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 import logging
+from pathlib import Path
 import sqlite3
 from threading import Lock
 
@@ -14,6 +15,7 @@ from api.routes import router
 from config.settings import load_settings
 from external.embedder import Encoder, OllamaEncoder
 from infrastructure.storage import IndexStorage, SQLiteStorage
+from services.indexing import read_corpus
 from services.search import BM25SearchService, SearchService
 
 
@@ -26,6 +28,7 @@ class AppDependencies:
 def _initialize_service(
     app: FastAPI,
     dependency_factory: Callable[[], AppDependencies] | None,
+    seed_demo: bool,
 ) -> SearchService | BM25SearchService | None:
     settings = load_settings()
     logging.basicConfig(
@@ -66,21 +69,28 @@ def _initialize_service(
     try:
         storage = SQLiteStorage(settings.database_path)
         cards = storage.load_cards(validate_snapshot=False)
+        if cards is None and seed_demo:
+            cards = read_corpus(Path(__file__).resolve().parent / "data/sample_theses.json")
+            service = BM25SearchService.from_cards(cards)
+            storage.replace_cards(cards)
+            logging.getLogger(__name__).info("Демокорпус сохранён: %s карточек", len(cards))
+            app.state.storage = storage
+            return service
         service = None if cards is None else BM25SearchService.from_cards(cards)
         app.state.storage = storage
         return service
     except (OSError, sqlite3.Error) as error:
         raise RuntimeError(
-            f"DATABASE_PATH: не удалось прочитать корпус SQLite из {settings.database_path}"
+            f"DATABASE_PATH: не удалось прочитать корпус SQLite или сохранить демоданные: {settings.database_path}"
         ) from error
 
 
 def create_app(
-    *, dependency_factory: Callable[[], AppDependencies] | None = None,
+    *, dependency_factory: Callable[[], AppDependencies] | None = None, seed_demo: bool = False,
 ) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        service = await run_in_threadpool(_initialize_service, app, dependency_factory)
+        service = await run_in_threadpool(_initialize_service, app, dependency_factory, seed_demo)
         app.state.search_service = service
         try:
             yield
@@ -91,7 +101,14 @@ def create_app(
 
     app = FastAPI(
         title="Поиск выпускных квалификационных работ",
-        description="Поиск ВКР: BM25 по SQLite или hybrid с Ollama BGE-M3.",
+        description=(
+            "Поиск по карточкам ВКР. В Docker автоматически загружается демокорпус из шести "
+            "работ, если SQLite ещё отсутствует. Откройте **POST /theses/search**, выберите "
+            "пример, нажмите **Try it out → Execute**. Запрос `Rasdaman` находит работу "
+            "«LLM для описания спутниковых данных». BM25 работает без моделей и Ollama. "
+            "Hybrid требует отдельно подключённой Ollama и недоступен в стандартном Docker-запуске. "
+            "**PUT /theses полностью заменяет корпус**, поэтому для первого поиска импорт не нужен."
+        ),
         version="0.1.0",
         lifespan=lifespan,
     )
@@ -102,6 +119,11 @@ def create_app(
     app.state.encode_lock = Lock()
     app.include_router(router)
     return app
+
+
+def create_demo_app() -> FastAPI:
+    """Фабрика Docker-запуска: существующий корпус никогда не заменяется демоданными."""
+    return create_app(seed_demo=True)
 
 
 app = create_app()

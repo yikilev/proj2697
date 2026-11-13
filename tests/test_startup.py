@@ -139,17 +139,20 @@ def test_missing_corpus_starts_without_creating_files(tmp_path, monkeypatch):
     assert TestClient(app).get("/health").status_code == 503
 
 
-def test_invalid_database_has_clear_error(tmp_path, monkeypatch):
+@pytest.mark.parametrize("seed_demo", [False, True])
+def test_invalid_database_has_clear_error(tmp_path, monkeypatch, seed_demo):
     path = tmp_path / "broken.sqlite3"
     path.write_text("not a SQLite database", encoding="utf-8")
     monkeypatch.setenv("DATABASE_PATH", str(path))
     with pytest.raises(RuntimeError, match="DATABASE_PATH: не удалось прочитать корпус SQLite"):
-        with TestClient(main.create_app()):
+        with TestClient(main.create_app(seed_demo=seed_demo)):
             pytest.fail("Startup must fail")
+    assert path.read_text(encoding="utf-8") == "not a SQLite database"
 
 
 @pytest.mark.parametrize("damage", ["empty_file", "missing_table", "invalid_column", "empty_corpus"])
-def test_invalid_existing_corpus_is_not_treated_as_missing(storage, monkeypatch, damage):
+@pytest.mark.parametrize("seed_demo", [False, True])
+def test_invalid_existing_corpus_is_not_treated_as_missing(storage, monkeypatch, damage, seed_demo):
     monkeypatch.setenv("DATABASE_PATH", str(storage.path))
     if damage == "empty_file":
         storage.path.write_bytes(b"")
@@ -162,9 +165,57 @@ def test_invalid_existing_corpus_is_not_treated_as_missing(storage, monkeypatch,
             }[damage])
     before = storage.path.read_bytes()
     with pytest.raises(ValueError):
-        with TestClient(main.create_app()):
+        with TestClient(main.create_app(seed_demo=seed_demo)):
             pytest.fail("Startup must fail")
     assert storage.path.read_bytes() == before
+
+
+def test_demo_startup_swagger_examples_and_persistence(tmp_path, monkeypatch):
+    path = tmp_path / "volume" / "theses.sqlite3"
+    monkeypatch.setenv("DATABASE_PATH", str(path))
+    encoder = Mock(side_effect=AssertionError("Demo must not connect to Ollama"))
+    monkeypatch.setattr(main, "OllamaEncoder", encoder)
+
+    with TestClient(main.create_demo_app()) as client:
+        health = client.get("/health")
+        assert health.status_code == 200
+        assert health.json() == {
+            "status": "ok", "index_loaded": True, "documents_count": 6,
+            "search_mode": "bm25", "embedding_model": None,
+        }
+        assert client.get("/docs").status_code == 200
+        spec = client.get("/openapi.json").json()
+        examples = spec["paths"]["/theses/search"]["post"]["requestBody"]["content"]["application/json"]["examples"]
+        expected = {
+            "satellite": ["hse-1162011207"],
+            "museums": ["hse-1154627811"],
+            "no_matches": [],
+        }
+        for name, ids in expected.items():
+            response = client.post("/theses/search", json=examples[name]["value"])
+            assert response.status_code == 200
+            assert [hit["id"] for hit in response.json()["results"]] == ids
+        demo_import = spec["components"]["schemas"]["ReplaceThesesRequest"]["examples"][0]
+        assert demo_import["cards"] == [client.get("/theses/hse-1162011207").json()]
+        parameters = spec["paths"]["/theses/{thesis_id}"]["get"]["parameters"]
+        example_id = parameters[0]["schema"]["examples"][0]
+        assert client.get(f"/theses/{example_id}").status_code == 200
+
+    before = path.read_bytes()
+    with TestClient(main.create_demo_app()) as client:
+        assert client.get("/health").json()["documents_count"] == 6
+        assert path.read_bytes() == before
+        # Пользовательский корпус должен пережить следующий запуск без досева демоданных.
+        card = {**demo_import["cards"][0], "id": "my-thesis", "title": "Моя работа"}
+        response = client.put("/theses", json={"cards": [card]})
+        assert response.status_code == 200
+    before = path.read_bytes()
+    with TestClient(main.create_demo_app()) as client:
+        assert client.get("/health").json()["documents_count"] == 1
+        assert client.get("/theses/my-thesis").json() == card
+        assert client.get("/theses/hse-1162011207").status_code == 404
+        assert path.read_bytes() == before
+    encoder.assert_not_called()
 
 
 def test_storage_access_error_aborts_startup(storage, monkeypatch):

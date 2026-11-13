@@ -1,0 +1,24 @@
+services:
+  backend:
+    build: .
+    environment:
+      DATABASE_PATH: /var/lib/proj2697/theses.sqlite3
+      OLLAMA_ENABLED: "false"
+      LOG_LEVEL: INFO
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - corpus:/var/lib/proj2697
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "from urllib.request import build_opener, ProxyHandler; build_opener(ProxyHandler({})).open('http://127.0.0.1:8000/health', timeout=2).close()"
+      interval: 2s
+      timeout: 3s
+      retries: 60
+    stop_grace_period: 10s
+
+volumes:
+  corpus:

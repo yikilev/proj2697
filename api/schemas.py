@@ -28,9 +28,26 @@ class NotReadyHealthResponse(BaseModel):
 
 
 class ReplaceThesesRequest(BaseModel):
-    model_config = ConfigDict(strict=True, extra="forbid")
+    model_config = ConfigDict(strict=True, extra="forbid", json_schema_extra={
+        "examples": [{"cards": [{
+            "id": "hse-1162011207",
+            "title": "LLM для описания спутниковых данных",
+            "abstract": (
+                "Предложена система ответов на вопросы о наблюдениях Земли, где языковая модель "
+                "выбирает данные и необходимые вычисления. План превращается в граф операций, "
+                "исполняемых средствами Rasdaman и инструментами обработки растров. Подход "
+                "проверяется на EarthBench: задачи затрагивают спектральные показатели, температуру, "
+                "изменения во времени и распознавание сцен. Разделение планирования и вычислений "
+                "позволяет локализовать ошибки обработки вопроса."
+            ),
+            "keywords": ["геопространственная аналитика", "LLM-планирование", "Rasdaman", "EarthBench", "обработка растров"],
+            "author": "Шехзад",
+            "year": 2026,
+            "url": "https://www.hse.ru/edu/vkr/1162011207",
+        }]}],
+    })
 
-    cards: list[Thesis] = Field(min_length=1)
+    cards: list[Thesis] = Field(min_length=1, description="Новый полный корпус; ID должны быть уникальными")
 
     @field_validator("cards")
     @classmethod
@@ -51,12 +68,15 @@ class ReplaceThesesResponse(BaseModel):
 class SearchRequest(BaseModel):
     model_config = ConfigDict(strict=True, extra="forbid")
 
-    search_mode: Literal["bm25", "hybrid"] = "bm25"
+    search_mode: Literal["bm25", "hybrid"] = Field(
+        default="bm25", description="bm25 работает сразу; hybrid требует подключённой Ollama и векторного индекса",
+    )
     query: Annotated[
-        str, StringConstraints(strip_whitespace=True, min_length=1, max_length=4000)
+        str, StringConstraints(strip_whitespace=True, min_length=1, max_length=4000),
+        Field(description="Тема или слова из карточки ВКР", examples=["Rasdaman"]),
     ]
-    top_k: int = Field(default=10, ge=1, le=100)
-    debug: bool = False
+    top_k: int = Field(default=10, ge=1, le=100, description="Максимальное число результатов")
+    debug: bool = Field(default=False, description="Добавить оценки и позиции отдельных поисковых каналов")
 
     @field_validator("query")
     @classmethod

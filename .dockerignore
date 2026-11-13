@@ -1,0 +1,19 @@
+# Only runtime sources, pinned dependencies and the demonstration corpus.
+# Everything else (including .env, databases, venvs, model weights and Git) stays out.
+**
+!requirements.txt
+!main.py
+!api/
+!api/*.py
+!config/
+!config/*.py
+!domain/
+!domain/*.py
+!external/
+!external/*.py
+!infrastructure/
+!infrastructure/*.py
+!services/
+!services/*.py
+!data/
+!data/sample_theses.json

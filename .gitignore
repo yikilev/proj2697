@@ -17,6 +17,9 @@ __pycache__/
 htmlcov/
 coverage.xml
 
+# Local agent instructions
+AGENTS.md
+
 # Local configuration and secrets (keep shareable examples)
 .env
 .env.*

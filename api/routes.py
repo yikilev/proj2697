@@ -6,7 +6,7 @@ import logging
 import sqlite3
 from time import perf_counter
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Body, Depends, HTTPException, Path, Request
 from fastapi.responses import JSONResponse
 
 from api.schemas import (
@@ -39,9 +39,34 @@ SearchDependency = Annotated[SearchService | BM25SearchService, Depends(get_sear
 
 @router.post(
     "/theses/search", response_model=SearchResponse,
+    summary="Найти ВКР по теме",
+    description=(
+        "BM25 ищет совпадающие слова в названии, ключевых словах и описании, без лемматизации. "
+        "Примеры рассчитаны на исходный демокорпус. `debug=true` добавляет оценки и позиции "
+        "поисковых каналов. Итоговый score — относительная оценка, не вероятность."
+    ),
     responses={503: {"description": "Корпус или эмбеддер недоступен"}},
 )
-def search_theses(body: SearchRequest, request: Request) -> SearchResponse:
+def search_theses(
+    body: Annotated[SearchRequest, Body(openapi_examples={
+        "satellite": {
+            "summary": "Спутниковые данные — одна работа",
+            "description": "На демокорпусе возвращает hse-1162011207 с диагностикой BM25.",
+            "value": {"query": "Rasdaman", "search_mode": "bm25", "top_k": 10, "debug": True},
+        },
+        "museums": {
+            "summary": "Цифровые каналы музеев",
+            "description": "На демокорпусе возвращает hse-1154627811 без диагностических полей.",
+            "value": {"query": "UTAUT2", "search_mode": "bm25", "top_k": 5, "debug": False},
+        },
+        "no_matches": {
+            "summary": "Нет совпадающих слов",
+            "description": "На демокорпусе возвращает пустой results и count=0.",
+            "value": {"query": "квантовая криптография", "search_mode": "bm25", "top_k": 10, "debug": False},
+        },
+    })],
+    request: Request,
+) -> SearchResponse:
     service = request.app.state.search_service
     if body.search_mode == "hybrid" and request.app.state.encoder is None:
         raise HTTPException(
@@ -56,8 +81,16 @@ def search_theses(body: SearchRequest, request: Request) -> SearchResponse:
         raise HTTPException(status_code=503, detail="Энкодер временно недоступен") from error
 
 
-@router.get("/theses/{thesis_id}", response_model=Thesis)
-def get_thesis(thesis_id: str, service: SearchDependency) -> Thesis:
+@router.get(
+    "/theses/{thesis_id}", response_model=Thesis,
+    summary="Получить карточку ВКР по ID",
+    description="Карточка и ссылка на оригинал без поисковых оценок. Пример ID взят из демокорпуса.",
+    responses={404: {"description": "ID не найден"}, 503: {"description": "Корпус не загружен"}},
+)
+def get_thesis(
+    thesis_id: Annotated[str, Path(description="ID из результатов поиска", examples=["hse-1162011207"])],
+    service: SearchDependency,
+) -> Thesis:
     card = service.get_thesis(thesis_id)
     if card is None:
         raise HTTPException(status_code=404, detail="Работа не найдена")
@@ -66,6 +99,13 @@ def get_thesis(thesis_id: str, service: SearchDependency) -> Thesis:
 
 @router.put(
     "/theses", response_model=ReplaceThesesResponse,
+    summary="Полностью заменить корпус",
+    description=(
+        "**Удаляет прежние карточки и заменяет их переданным массивом cards.** "
+        "Пример оставит в корпусе только одну демонстрационную работу. "
+        "Для поиска после первого Docker-запуска вызывать этот метод не нужно. "
+        "Новый корпус сохраняется в SQLite и используется после перезапуска."
+    ),
     responses={503: {"description": "Хранилище или энкодер недоступен; корпус не заменён"}},
 )
 def replace_theses(body: ReplaceThesesRequest, request: Request) -> ReplaceThesesResponse:
@@ -116,6 +156,12 @@ def replace_theses(body: ReplaceThesesRequest, request: Request) -> ReplaceThese
 
 @router.get(
     "/health", response_model=HealthResponse,
+    summary="Проверить готовность поиска",
+    description=(
+        "200 означает, что корпус загружен и поиск готов. До импорта — 503. "
+        "После первого Docker-запуска documents_count=6, search_mode=bm25. "
+        "Проверка не обращается к Ollama."
+    ),
     responses={503: {"model": NotReadyHealthResponse, "description": "Корпус не загружен"}},
 )
 def health(request: Request) -> HealthResponse | JSONResponse:
